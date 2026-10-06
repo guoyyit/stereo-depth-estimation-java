@@ -49,7 +49,12 @@ public final class StereoPipeline {
         checkCancelled(cancelled);
 
         String version = paramsSnapshot.version();
-        RectificationMaps maps = mapsCache.computeIfAbsent(version,
+        // Cache key binds the version label to the exact calibration content of this frame's
+        // snapshot, so every stage of one frame (rectification, depth, point cloud) is derived
+        // from one and the same calibration content, and a frame can never observe maps built
+        // from different content that happens to carry the same version label.
+        String mapsKey = version + "@" + paramsSnapshot.contentFingerprint();
+        RectificationMaps maps = mapsCache.computeIfAbsent(mapsKey,
                 key -> rectificationEngine.buildMaps(paramsSnapshot));
         checkCancelled(cancelled);
 

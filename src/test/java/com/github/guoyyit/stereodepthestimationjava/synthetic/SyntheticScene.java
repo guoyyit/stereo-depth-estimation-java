@@ -141,8 +141,10 @@ public final class SyntheticScene {
         RectificationMaps maps = new RectificationEngine().buildMaps(calibration);
         float[] mapX = leftSide ? maps.mapXLeft() : maps.mapXRight();
         float[] mapY = leftSide ? maps.mapYLeft() : maps.mapYRight();
+        // Inverse-warp rendering: for every raw pixel, locate its rectified source
+        // coordinate by inverting the rectification map (Newton iteration on the
+        // bilinearly interpolated map field), then sample the rectified image there.
         float[] raw = new float[width * height];
-        float[] weight = new float[width * height];
         for (int py = 0; py < height; py++) {
             for (int px = 0; px < width; px++) {
                 int p = py * width + px;
@@ -184,19 +186,15 @@ public final class SyntheticScene {
                 int x0 = (int) Math.floor(rx);
                 int y0 = (int) Math.floor(ry);
                 if (x0 < 0 || y0 < 0 || x0 >= width - 1 || y0 >= height - 1) {
+                    raw[p] = 0f;
                     continue;
                 }
                 float fx = rx - x0;
                 float fy = ry - y0;
-                float value = rectified[p];
-                splat(raw, weight, width, x0, y0, (1 - fx) * (1 - fy), value);
-                splat(raw, weight, width, x0 + 1, y0, fx * (1 - fy), value);
-                splat(raw, weight, width, x0, y0 + 1, (1 - fx) * fy, value);
-                splat(raw, weight, width, x0 + 1, y0 + 1, fx * fy, value);
+                raw[p] = bilinear(rectified[y0 * width + x0], rectified[y0 * width + x0 + 1],
+                        rectified[(y0 + 1) * width + x0], rectified[(y0 + 1) * width + x0 + 1],
+                        fx, fy);
             }
-        }
-        for (int i = 0; i < raw.length; i++) {
-            raw[i] = weight[i] > 1e-6f ? raw[i] / weight[i] : 0f;
         }
         return raw;
     }
@@ -205,16 +203,6 @@ public final class SyntheticScene {
         float top = v00 + (v01 - v00) * fx;
         float bottom = v10 + (v11 - v10) * fx;
         return top + (bottom - top) * fy;
-    }
-
-    private static void splat(float[] raw, float[] weight, int width, int x, int y,
-                              float w, float value) {
-        if (w <= 0f) {
-            return;
-        }
-        int i = y * width + x;
-        raw[i] += value * w;
-        weight[i] += w;
     }
 
     private static float clamp(float v) {

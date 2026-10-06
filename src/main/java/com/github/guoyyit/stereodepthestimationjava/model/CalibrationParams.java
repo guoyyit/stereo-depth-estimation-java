@@ -57,6 +57,44 @@ public final class CalibrationParams {
         return new CalibrationParams(version, imageWidth, imageHeight, k, d, r, t);
     }
 
+    /**
+     * Content equality ignoring nothing: every calibration field must be bit-identical.
+     * Used by the registry to enforce immutability of an already-used version identifier.
+     */
+    public boolean contentEquals(CalibrationParams other) {
+        if (other == null) {
+            return false;
+        }
+        return imageWidth == other.imageWidth
+                && imageHeight == other.imageHeight
+                && java.util.Arrays.equals(k, other.k)
+                && java.util.Arrays.equals(d, other.d)
+                && java.util.Arrays.equals(r, other.r)
+                && java.util.Arrays.equals(t, other.t);
+    }
+
+    /**
+     * Stable fingerprint of the full calibration content (excluding the version label).
+     * Two params with equal content always yield equal fingerprints.
+     */
+    public String contentFingerprint() {
+        long h = 1125899906842597L;
+        h = 31 * h + imageWidth;
+        h = 31 * h + imageHeight;
+        h = mix(h, k);
+        h = mix(h, d);
+        h = mix(h, r);
+        h = mix(h, t);
+        return Long.toHexString(h);
+    }
+
+    private static long mix(long h, double[] values) {
+        for (double v : values) {
+            h = 31 * h + Double.doubleToLongBits(v);
+        }
+        return h;
+    }
+
     private static void requireLength(double[] values, int expected, String name) {
         if (values == null || values.length != expected) {
             throw new IllegalArgumentException(name + " must have length " + expected);

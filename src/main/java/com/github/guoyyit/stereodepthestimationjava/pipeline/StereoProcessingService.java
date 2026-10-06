@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -63,74 +64,88 @@ public final class StereoProcessingService implements AutoCloseable {
                 : registry.resolve(request.requestedCalibrationVersion());
 
         String frameId = request.frameId();
-        AtomicBoolean cancelToken = new AtomicBoolean(false);
-        CompletableFuture<StereoResult> future = new CompletableFuture<>();
-        long startedNanos = System.nanoTime();
-
-        FrameTask existing = active.putIfAbsent(frameId, new FrameTask(cancelToken));
+        FrameTask task = new FrameTask(frameId, snapshot, completionCallback);
+        FrameTask existing = active.putIfAbsent(frameId, task);
         if (existing != null) {
             throw new InvalidFrameException("frame id already in flight: " + frameId);
         }
         submitted.incrementAndGet();
 
         StereoPipeline pipeline = new StereoPipeline(registry, config);
-        executor.submit(() -> {
-            StereoResult result = null;
-            Throwable failure = null;
-            try {
-                if (cancelToken.get()) {
-                    throw new FrameCancelledException("frame cancelled before processing: " + frameId);
-                }
-                result = pipeline.processWith(request, snapshot, cancelToken::get);
-            } catch (Throwable t) {
-                failure = t;
-            } finally {
-                active.remove(frameId);
-                long durationMillis = (System.nanoTime() - startedNanos) / 1_000_000L;
-                boolean wasCancelled = failure instanceof FrameCancelledException
-                        || (failure == null && cancelToken.get());
-                FrameExecutionInfo info;
-                if (failure == null) {
-                    if (cancelToken.get()) {
-                        cancelled.incrementAndGet();
-                        info = new FrameExecutionInfo(frameId, snapshot.version(), false, true,
-                                "frame cancelled after processing reached completion",
-                                durationMillis);
-                    } else {
-                        succeeded.incrementAndGet();
-                        info = new FrameExecutionInfo(frameId, snapshot.version(), true, false,
-                                null, durationMillis);
-                    }
-                } else if (wasCancelled) {
-                    cancelled.incrementAndGet();
-                    info = new FrameExecutionInfo(frameId, snapshot.version(), false, true,
-                            failure.getMessage(), durationMillis);
-                } else {
-                    failed.incrementAndGet();
-                    info = new FrameExecutionInfo(frameId, snapshot.version(), false, false,
-                            failure.getMessage(), durationMillis);
-                }
-                recordHistory(info);
-                if (completionCallback != null) {
-                    invokeCallback(completionCallback, info);
-                }
-                if (failure == null) {
-                    if (cancelToken.get()) {
-                        future.completeExceptionally(
-                                new FrameCancelledException("frame cancelled: " + frameId));
-                    } else {
-                        future.complete(result);
-                    }
-                } else if (wasCancelled) {
-                    future.completeExceptionally(
-                            failure instanceof FrameCancelledException ? failure
-                                    : new FrameCancelledException("frame cancelled: " + frameId));
-                } else {
-                    future.completeExceptionally(failure);
-                }
+        try {
+            // execute() (not submit()) keeps the FrameRunnable itself on the work queue,
+            // so close() can identify and terminally complete dropped queued frames.
+            executor.execute(new FrameRunnable(task, () -> runFrame(task, request, snapshot, pipeline)));
+        } catch (RejectedExecutionException e) {
+            active.remove(frameId, task);
+            submitted.decrementAndGet();
+            throw new StereoPipelineException("processing service is closed; frame rejected: "
+                    + frameId);
+        }
+        return task.future;
+    }
+
+    private void runFrame(FrameTask task, FrameRequest request, CalibrationParams snapshot,
+                          StereoPipeline pipeline) {
+        StereoResult result = null;
+        Throwable failure = null;
+        try {
+            if (task.cancelToken.get()) {
+                throw new FrameCancelledException("frame cancelled before processing: "
+                        + task.frameId);
             }
-        });
-        return future;
+            result = pipeline.processWith(request, snapshot, task.cancelToken::get);
+        } catch (Throwable t) {
+            failure = t;
+        } finally {
+            finish(task, snapshot, result, failure);
+        }
+    }
+
+    /**
+     * Terminally records and completes a frame exactly once, whether the frame ran to
+     * completion, failed, was cancelled cooperatively, or was dropped from the queue on
+     * shutdown. This is what guarantees that no submitted request can ever remain
+     * unanswered and that cancelled frames stay distinguishable in stats and history.
+     */
+    private void finish(FrameTask task, CalibrationParams snapshot, StereoResult result,
+                        Throwable failure) {
+        if (!task.terminalRecorded.compareAndSet(false, true)) {
+            return;
+        }
+        active.remove(task.frameId, task);
+        long durationMillis = (System.nanoTime() - task.startedNanos) / 1_000_000L;
+        boolean wasCancelled = failure instanceof FrameCancelledException
+                || (failure == null && task.cancelToken.get());
+        FrameExecutionInfo info;
+        if (failure == null && !task.cancelToken.get()) {
+            succeeded.incrementAndGet();
+            info = new FrameExecutionInfo(task.frameId, snapshot.version(), true, false,
+                    null, durationMillis);
+        } else if (wasCancelled) {
+            cancelled.incrementAndGet();
+            String message = failure != null ? failure.getMessage()
+                    : "frame cancelled after processing reached completion";
+            info = new FrameExecutionInfo(task.frameId, snapshot.version(), false, true,
+                    message, durationMillis);
+        } else {
+            failed.incrementAndGet();
+            info = new FrameExecutionInfo(task.frameId, snapshot.version(), false, false,
+                    failure.getMessage(), durationMillis);
+        }
+        recordHistory(info);
+        if (task.completionCallback != null) {
+            invokeCallback(task.completionCallback, info);
+        }
+        if (failure == null && !task.cancelToken.get()) {
+            task.future.complete(result);
+        } else if (wasCancelled) {
+            task.future.completeExceptionally(
+                    failure instanceof FrameCancelledException ? failure
+                            : new FrameCancelledException("frame cancelled: " + task.frameId));
+        } else {
+            task.future.completeExceptionally(failure);
+        }
     }
 
     public boolean cancel(String frameId, boolean mayInterruptIfRunning) {
@@ -160,7 +175,20 @@ public final class StereoProcessingService implements AutoCloseable {
 
     @Override
     public void close() {
-        executor.shutdownNow();
+        // Frames still queued are dropped by shutdownNow; complete them as cancelled so
+        // their futures never stay pending forever. Frames already running are not
+        // interrupted and finish cooperatively, completing their own futures.
+        List<Runnable> dropped = executor.shutdownNow();
+        for (Runnable runnable : dropped) {
+            if (runnable instanceof FrameRunnable frameRunnable) {
+                FrameTask task = frameRunnable.task;
+                task.cancelToken.set(true);
+                finish(task, task.snapshot, null,
+                        new FrameCancelledException(
+                                "service closed before frame processing started: "
+                                        + task.frameId));
+            }
+        }
     }
 
     private void recordHistory(FrameExecutionInfo info) {
@@ -202,11 +230,35 @@ public final class StereoProcessingService implements AutoCloseable {
         }
     }
 
-    private static final class FrameTask {
-        private final AtomicBoolean cancelToken;
+    private static final class FrameRunnable implements Runnable {
+        private final FrameTask task;
+        private final Runnable body;
 
-        private FrameTask(AtomicBoolean cancelToken) {
-            this.cancelToken = cancelToken;
+        private FrameRunnable(FrameTask task, Runnable body) {
+            this.task = task;
+            this.body = body;
+        }
+
+        @Override
+        public void run() {
+            body.run();
+        }
+    }
+
+    private static final class FrameTask {
+        private final String frameId;
+        private final CalibrationParams snapshot;
+        private final Consumer<FrameExecutionInfo> completionCallback;
+        private final AtomicBoolean cancelToken = new AtomicBoolean(false);
+        private final AtomicBoolean terminalRecorded = new AtomicBoolean(false);
+        private final CompletableFuture<StereoResult> future = new CompletableFuture<>();
+        private final long startedNanos = System.nanoTime();
+
+        private FrameTask(String frameId, CalibrationParams snapshot,
+                          Consumer<FrameExecutionInfo> completionCallback) {
+            this.frameId = frameId;
+            this.snapshot = snapshot;
+            this.completionCallback = completionCallback;
         }
     }
 }

@@ -32,4 +32,32 @@ public final class TestCalibrations {
         double[] t = {-fx * baseline, 0, 0};
         return CalibrationParams.create("calib-v2", width, height, k, d, r, t);
     }
+
+    /** Strong radial+tangential distortion, still inside the documented supported range. */
+    public static CalibrationParams strongDistortion(int width, int height) {
+        double fx = width * 1.1;
+        double fy = fx;
+        double cx = width / 2.0;
+        double cy = height / 2.0;
+        double[] k = {fx, 0, cx, 0, fy, cy, 0, 0, 1};
+        double[] d = {-0.28, 0.15, 0.008, -0.006, -0.05};
+        double[] r = {0.01, -0.008, 0.006};
+        double baseline = 0.12;
+        double[] t = {-fx * baseline, 0, 0};
+        return CalibrationParams.create("calib-strong-d", width, height, k, d, r, t);
+    }
+
+    /** Strong inter-camera rotation, still inside the documented supported range. */
+    public static CalibrationParams strongRotation(int width, int height) {
+        double fx = width * 1.1;
+        double fy = fx;
+        double cx = width / 2.0;
+        double cy = height / 2.0;
+        double[] k = {fx, 0, cx, 0, fy, cy, 0, 0, 1};
+        double[] d = {-0.05, 0.02, 0.001, 0.001, 0.0};
+        double[] r = {0.12, -0.18, 0.08};
+        double baseline = 0.12;
+        double[] t = {-fx * baseline, 0.002 * fx, 0.001 * fx};
+        return CalibrationParams.create("calib-strong-r", width, height, k, d, r, t);
+    }
 }

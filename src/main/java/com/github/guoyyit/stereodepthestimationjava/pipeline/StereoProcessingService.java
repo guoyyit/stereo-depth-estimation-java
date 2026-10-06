@@ -13,7 +13,9 @@ import com.github.guoyyit.stereodepthestimationjava.model.StereoResult;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -26,8 +28,7 @@ public final class StereoProcessingService implements AutoCloseable {
     private final CalibrationRegistry registry;
     private final PipelineConfig config;
     private final ThreadPoolExecutor executor;
-    private final java.util.concurrent.ConcurrentHashMap<String, FrameTask> active =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, FrameTask> active = new ConcurrentHashMap<>();
     private final ArrayDeque<FrameExecutionInfo> history = new ArrayDeque<>();
     private final Object historyLock = new Object();
     private final AtomicLong submitted = new AtomicLong();
@@ -63,74 +64,90 @@ public final class StereoProcessingService implements AutoCloseable {
                 : registry.resolve(request.requestedCalibrationVersion());
 
         String frameId = request.frameId();
-        AtomicBoolean cancelToken = new AtomicBoolean(false);
-        CompletableFuture<StereoResult> future = new CompletableFuture<>();
-        long startedNanos = System.nanoTime();
-
-        FrameTask existing = active.putIfAbsent(frameId, new FrameTask(cancelToken));
+        FrameTask task = new FrameTask(frameId, snapshot);
+        FrameTask existing = active.putIfAbsent(frameId, task);
         if (existing != null) {
             throw new InvalidFrameException("frame id already in flight: " + frameId);
         }
         submitted.incrementAndGet();
 
         StereoPipeline pipeline = new StereoPipeline(registry, config);
-        executor.submit(() -> {
-            StereoResult result = null;
-            Throwable failure = null;
-            try {
-                if (cancelToken.get()) {
-                    throw new FrameCancelledException("frame cancelled before processing: " + frameId);
-                }
-                result = pipeline.processWith(request, snapshot, cancelToken::get);
-            } catch (Throwable t) {
-                failure = t;
-            } finally {
-                active.remove(frameId);
-                long durationMillis = (System.nanoTime() - startedNanos) / 1_000_000L;
-                boolean wasCancelled = failure instanceof FrameCancelledException
-                        || (failure == null && cancelToken.get());
-                FrameExecutionInfo info;
-                if (failure == null) {
-                    if (cancelToken.get()) {
-                        cancelled.incrementAndGet();
-                        info = new FrameExecutionInfo(frameId, snapshot.version(), false, true,
-                                "frame cancelled after processing reached completion",
-                                durationMillis);
-                    } else {
-                        succeeded.incrementAndGet();
-                        info = new FrameExecutionInfo(frameId, snapshot.version(), true, false,
-                                null, durationMillis);
-                    }
-                } else if (wasCancelled) {
-                    cancelled.incrementAndGet();
-                    info = new FrameExecutionInfo(frameId, snapshot.version(), false, true,
-                            failure.getMessage(), durationMillis);
-                } else {
-                    failed.incrementAndGet();
-                    info = new FrameExecutionInfo(frameId, snapshot.version(), false, false,
-                            failure.getMessage(), durationMillis);
-                }
-                recordHistory(info);
-                if (completionCallback != null) {
-                    invokeCallback(completionCallback, info);
-                }
-                if (failure == null) {
-                    if (cancelToken.get()) {
-                        future.completeExceptionally(
-                                new FrameCancelledException("frame cancelled: " + frameId));
-                    } else {
-                        future.complete(result);
-                    }
-                } else if (wasCancelled) {
-                    future.completeExceptionally(
-                            failure instanceof FrameCancelledException ? failure
-                                    : new FrameCancelledException("frame cancelled: " + frameId));
-                } else {
-                    future.completeExceptionally(failure);
-                }
+        try {
+            executor.submit(() -> runFrame(request, snapshot, pipeline, task,
+                    completionCallback));
+        } catch (RuntimeException rejected) {
+            // The executor refused the task (e.g. service closed): the frame must
+            // still reach a terminal state instead of hanging forever.
+            active.remove(frameId, task);
+            finalizeExactlyOnce(task, snapshot, null,
+                    new StereoPipelineException("frame was rejected by the executor: "
+                            + rejected.getMessage()),
+                    completionCallback);
+        }
+        return task.future;
+    }
+
+    private void runFrame(FrameRequest request, CalibrationParams snapshot,
+                          StereoPipeline pipeline, FrameTask task,
+                          Consumer<FrameExecutionInfo> completionCallback) {
+        StereoResult result = null;
+        Throwable failure = null;
+        try {
+            if (task.cancelToken.get()) {
+                throw new FrameCancelledException(
+                        "frame cancelled before processing: " + task.frameId);
             }
-        });
-        return future;
+            result = pipeline.processWith(request, snapshot, task.cancelToken::get);
+        } catch (Throwable t) {
+            failure = t;
+        } finally {
+            active.remove(task.frameId, task);
+            finalizeExactlyOnce(task, snapshot, result, failure, completionCallback);
+        }
+    }
+
+    /**
+     * Exactly-once terminal bookkeeping. Whichever path wins the CAS (worker
+     * completion, executor rejection, or service close) records the outcome; every
+     * submitted frame therefore always reaches a terminal state and its future
+     * always completes.
+     */
+    private void finalizeExactlyOnce(FrameTask task, CalibrationParams snapshot,
+                                     StereoResult result, Throwable failure,
+                                     Consumer<FrameExecutionInfo> completionCallback) {
+        if (!task.completed.compareAndSet(false, true)) {
+            return;
+        }
+        long durationMillis = (System.nanoTime() - task.startedNanos) / 1_000_000L;
+        boolean wasCancelled = failure instanceof FrameCancelledException
+                || (failure == null && task.cancelToken.get());
+        FrameExecutionInfo info;
+        if (failure == null && !task.cancelToken.get()) {
+            succeeded.incrementAndGet();
+            info = new FrameExecutionInfo(task.frameId, snapshot.version(), true, false,
+                    null, durationMillis);
+            recordHistory(info);
+            invokeCallback(completionCallback, info);
+            task.future.complete(result);
+        } else if (wasCancelled) {
+            cancelled.incrementAndGet();
+            String message = failure != null ? failure.getMessage()
+                    : "frame cancelled after processing reached completion";
+            info = new FrameExecutionInfo(task.frameId, snapshot.version(), false, true,
+                    message, durationMillis);
+            recordHistory(info);
+            invokeCallback(completionCallback, info);
+            task.future.completeExceptionally(
+                    failure instanceof FrameCancelledException ? failure
+                            : new FrameCancelledException("frame cancelled: " + task.frameId));
+        } else {
+            failed.incrementAndGet();
+            info = new FrameExecutionInfo(task.frameId, snapshot.version(), false, false,
+                    failure.getMessage(), durationMillis);
+            recordHistory(info);
+            invokeCallback(completionCallback, info);
+            task.future.completeExceptionally(failure);
+        }
     }
 
     public boolean cancel(String frameId, boolean mayInterruptIfRunning) {
@@ -161,6 +178,18 @@ public final class StereoProcessingService implements AutoCloseable {
     @Override
     public void close() {
         executor.shutdownNow();
+        // Frames still queued or running when the service closes must not hang:
+        // force every remaining in-flight frame to a cancelled terminal state.
+        for (Map.Entry<String, FrameTask> entry : active.entrySet()) {
+            FrameTask task = entry.getValue();
+            if (active.remove(entry.getKey(), task)) {
+                task.cancelToken.set(true);
+                finalizeExactlyOnce(task, task.snapshot, null,
+                        new FrameCancelledException(
+                                "service closed before frame completed: " + task.frameId),
+                        null);
+            }
+        }
     }
 
     private void recordHistory(FrameExecutionInfo info) {
@@ -174,6 +203,9 @@ public final class StereoProcessingService implements AutoCloseable {
 
     private static void invokeCallback(Consumer<FrameExecutionInfo> callback,
                                        FrameExecutionInfo info) {
+        if (callback == null) {
+            return;
+        }
         try {
             callback.accept(info);
         } catch (RuntimeException ignored) {
@@ -203,10 +235,17 @@ public final class StereoProcessingService implements AutoCloseable {
     }
 
     private static final class FrameTask {
-        private final AtomicBoolean cancelToken;
+        private final String frameId;
+        private final CalibrationParams snapshot;
+        private final long startedNanos;
+        private final AtomicBoolean cancelToken = new AtomicBoolean(false);
+        private final AtomicBoolean completed = new AtomicBoolean(false);
+        private final CompletableFuture<StereoResult> future = new CompletableFuture<>();
 
-        private FrameTask(AtomicBoolean cancelToken) {
-            this.cancelToken = cancelToken;
+        private FrameTask(String frameId, CalibrationParams snapshot) {
+            this.frameId = frameId;
+            this.snapshot = snapshot;
+            this.startedNanos = System.nanoTime();
         }
     }
 }

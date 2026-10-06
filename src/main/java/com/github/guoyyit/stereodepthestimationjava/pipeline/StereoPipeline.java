@@ -6,6 +6,7 @@ import com.github.guoyyit.stereodepthestimationjava.calibration.RectificationEng
 import com.github.guoyyit.stereodepthestimationjava.cost.CostComputer;
 import com.github.guoyyit.stereodepthestimationjava.depth.DepthPointCloudBuilder;
 import com.github.guoyyit.stereodepthestimationjava.disparity.StereoMatcher;
+import com.github.guoyyit.stereodepthestimationjava.error.CalibrationVersionException;
 import com.github.guoyyit.stereodepthestimationjava.error.FrameCancelledException;
 import com.github.guoyyit.stereodepthestimationjava.error.InvalidFrameException;
 import com.github.guoyyit.stereodepthestimationjava.model.CalibrationParams;
@@ -49,8 +50,7 @@ public final class StereoPipeline {
         checkCancelled(cancelled);
 
         String version = paramsSnapshot.version();
-        RectificationMaps maps = mapsCache.computeIfAbsent(version,
-                key -> rectificationEngine.buildMaps(paramsSnapshot));
+        RectificationMaps maps = mapsFor(version, paramsSnapshot);
         checkCancelled(cancelled);
 
         ImageRectifier rectifier = new ImageRectifier(config.borderMode());
@@ -83,6 +83,30 @@ public final class StereoPipeline {
         PointCloud pointCloud = builder.toPointCloud(full, kNew, version);
 
         return new StereoResult(request.frameId(), version, full, depth, pointCloud);
+    }
+
+    /**
+     * Returns the rectification maps for the exact calibration content of this frame.
+     * The cache is keyed by version, but a cached entry is only reused when its content
+     * fingerprint matches the frame's snapshot, so every stage of a frame provably uses
+     * one and the same calibration content. A version label attached to different
+     * content is rejected explicitly instead of silently mixing geometries.
+     */
+    private RectificationMaps mapsFor(String version, CalibrationParams paramsSnapshot) {
+        long fingerprint = paramsSnapshot.contentFingerprint();
+        RectificationMaps cached = mapsCache.get(version);
+        if (cached != null && cached.contentFingerprint() == fingerprint) {
+            return cached;
+        }
+        RectificationMaps built = rectificationEngine.buildMaps(paramsSnapshot);
+        RectificationMaps raced = mapsCache.putIfAbsent(version, built);
+        if (raced == null || raced.contentFingerprint() == fingerprint) {
+            return raced == null ? built : raced;
+        }
+        throw new CalibrationVersionException(
+                "calibration version '" + version + "' maps to different content within this"
+                        + " pipeline; refusing to mix calibration geometries in one frame",
+                CalibrationVersionException.Reason.CONTENT_CONFLICT);
     }
 
     private DisparityMap upscaleDisparity(DisparityMap coarse, int fullWidth, int fullHeight,

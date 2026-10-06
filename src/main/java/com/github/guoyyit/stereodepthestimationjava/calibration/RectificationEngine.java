@@ -1,16 +1,45 @@
 package com.github.guoyyit.stereodepthestimationjava.calibration;
 
-import com.github.guoyyit.stereodepthestimationjava.error.StereoPipelineException;
+import com.github.guoyyit.stereodepthestimationjava.error.RectificationException;
 import com.github.guoyyit.stereodepthestimationjava.model.CalibrationParams;
 import com.github.guoyyit.stereodepthestimationjava.model.RectificationMaps;
 import com.github.guoyyit.stereodepthestimationjava.util.Mat;
 
+/**
+ * Builds Bouguet half-rotation rectification maps for the Brown-Conrady distortion
+ * model ({@code k1,k2,p1,p2,k3}).
+ *
+ * <p>Accuracy is only guaranteed inside the documented supported range
+ * (see {@link #MAX_RADIAL_K1} etc.). Inside that range the self-checked reprojection
+ * residual of the built maps is at most {@link #SELF_CHECK_RESIDUAL_PX} pixels.
+ * Anything outside the range, or any map that fails the self-check, is rejected with
+ * a {@link RectificationException} carrying a machine-distinguishable reason instead
+ * of silently emitting degraded or non-finite geometry.</p>
+ */
 public final class RectificationEngine {
+
+    /** Supported range: |k1| (radial, first order). */
+    public static final double MAX_RADIAL_K1 = 0.3;
+    /** Supported range: |k2| (radial, second order). */
+    public static final double MAX_RADIAL_K2 = 0.5;
+    /** Supported range: |k3| (radial, third order). */
+    public static final double MAX_RADIAL_K3 = 0.5;
+    /** Supported range: |p1|, |p2| (tangential). */
+    public static final double MAX_TANGENTIAL = 0.02;
+    /** Supported range: rotation vector norm between the two cameras, in radians. */
+    public static final double MAX_ROTATION_RAD = 0.35;
+    /**
+     * Upper bound on the self-checked reprojection residual (round trip
+     * pixel -&gt; undistort -&gt; distort -&gt; pixel) of the built maps, in pixels.
+     */
+    public static final double SELF_CHECK_RESIDUAL_PX = 0.01;
 
     public RectificationEngine() {
     }
 
     public RectificationMaps buildMaps(CalibrationParams params) {
+        validateSupportedRange(params);
+
         double[] k = params.k();
         double[] d = params.d();
         double[] r = params.r();
@@ -21,10 +50,14 @@ public final class RectificationEngine {
         Mat rHalf = Mat.rodrigues(om[0] / 2.0, om[1] / 2.0, om[2] / 2.0);
         Mat rHalfInverse = Mat.rodrigues(-om[0] / 2.0, -om[1] / 2.0, -om[2] / 2.0);
 
-        double[] tNew = multiplyVector(rHalf, t);
+        // Epipolar-frame x axis: the rectified camera-2 center must lie on the
+        // rectified x axis, i.e. R2 * t must be parallel to e1. With
+        // R2 = R_rect * R(-om/2) this requires e1 || R(-om/2) * t.
+        double[] tNew = multiplyVector(rHalfInverse, t);
         double tNorm = norm(tNew);
         if (tNorm < 1e-12) {
-            throw new StereoPipelineException("stereo baseline length must not be zero");
+            throw new RectificationException("stereo baseline length must not be zero",
+                    RectificationException.Reason.DEGENERATE_BASELINE);
         }
 
         double[] e1 = {tNew[0] / tNorm, tNew[1] / tNorm, tNew[2] / tNorm};
@@ -48,6 +81,12 @@ public final class RectificationEngine {
         double fy = kNew[1];
         double cx = kNew[2];
         double cy = kNew[3];
+        if (!Double.isFinite(fx) || !Double.isFinite(fy) || fx <= 0 || fy <= 0
+                || !Double.isFinite(cx) || !Double.isFinite(cy)) {
+            throw new RectificationException(
+                    "rectified intrinsics are not finite and positive: " + java.util.Arrays.toString(kNew),
+                    RectificationException.Reason.NON_FINITE_MAP);
+        }
 
         int width = params.imageWidth();
         int height = params.imageHeight();
@@ -65,8 +104,54 @@ public final class RectificationEngine {
                 fillMapPoint(nx, ny, r2, k, d, mapXRight, mapYRight, index);
             }
         }
-        return new RectificationMaps(params.version(), width, height, kNew,
+        rejectNonFinite(mapXLeft, "mapXLeft");
+        rejectNonFinite(mapYLeft, "mapYLeft");
+        rejectNonFinite(mapXRight, "mapXRight");
+        rejectNonFinite(mapYRight, "mapYRight");
+        return new RectificationMaps(params.version(), params.contentFingerprint(),
+                width, height, kNew,
                 mapXLeft, mapYLeft, mapXRight, mapYRight);
+    }
+
+    /**
+     * Enforces the documented supported range. Outside this range rectification is
+     * refused explicitly rather than attempted with unbounded error.
+     */
+    private static void validateSupportedRange(CalibrationParams params) {
+        double[] d = params.d();
+        double[] r = params.r();
+        double[] t = params.t();
+        double rotationNorm = norm(r);
+        double baseline = norm(t);
+        if (Math.abs(d[0]) > MAX_RADIAL_K1 || Math.abs(d[1]) > MAX_RADIAL_K2
+                || Math.abs(d[4]) > MAX_RADIAL_K3
+                || Math.abs(d[2]) > MAX_TANGENTIAL || Math.abs(d[3]) > MAX_TANGENTIAL
+                || rotationNorm > MAX_ROTATION_RAD) {
+            throw new RectificationException(
+                    "calibration '" + params.version() + "' is outside the supported"
+                            + " distortion/rotation range (|k1|<=" + MAX_RADIAL_K1
+                            + ", |k2|<=" + MAX_RADIAL_K2 + ", |k3|<=" + MAX_RADIAL_K3
+                            + ", |p1|,|p2|<=" + MAX_TANGENTIAL
+                            + ", |r|<=" + MAX_ROTATION_RAD + " rad): d="
+                            + java.util.Arrays.toString(d) + " r="
+                            + java.util.Arrays.toString(r),
+                    RectificationException.Reason.OUT_OF_SUPPORTED_RANGE);
+        }
+        if (baseline < 1e-12) {
+            throw new RectificationException("stereo baseline length must not be zero",
+                    RectificationException.Reason.DEGENERATE_BASELINE);
+        }
+    }
+
+    private static void rejectNonFinite(float[] map, String name) {
+        for (float v : map) {
+            if (Float.isNaN(v) || Float.isInfinite(v)) {
+                throw new RectificationException(
+                        "rectification " + name + " contains non-finite entries;"
+                                + " calibration is not rectifiable within accuracy bounds",
+                        RectificationException.Reason.NON_FINITE_MAP);
+            }
+        }
     }
 
     private static double[] rotationVector(Mat rotation) {
@@ -93,9 +178,9 @@ public final class RectificationEngine {
         double[] cameraNormalized = multiplyVector(rotationRect.transpose(),
                 new double[] {nx, ny, 1.0});
         if (cameraNormalized[2] <= 1e-12) {
-            mapX[index] = Float.NaN;
-            mapY[index] = Float.NaN;
-            return;
+            throw new RectificationException(
+                    "rectification maps project behind the camera",
+                    RectificationException.Reason.BEHIND_CAMERA);
         }
         double x = cameraNormalized[0] / cameraNormalized[2];
         double y = cameraNormalized[1] / cameraNormalized[2];
@@ -139,12 +224,41 @@ public final class RectificationEngine {
         double xDistorted = (pixelX - k[2]) / k[0];
         double yDistorted = (pixelY - k[5]) / k[4];
         double[] undistorted = undistortNormalized(xDistorted, yDistorted, d);
+        checkSolverResidual(xDistorted, yDistorted, undistorted, d, k);
         double[] rotated = multiplyVector(rotationRect,
                 new double[] {undistorted[0], undistorted[1], 1.0});
         if (rotated[2] <= 1e-12) {
-            throw new StereoPipelineException("rectification maps project behind the camera");
+            throw new RectificationException("rectification maps project behind the camera",
+                    RectificationException.Reason.BEHIND_CAMERA);
         }
         return new double[] {rotated[0] / rotated[2], rotated[1] / rotated[2]};
+    }
+
+    /**
+     * Self-check: re-distorting the solved undistorted point must reproduce the
+     * original distorted point within {@link #SELF_CHECK_RESIDUAL_PX} pixels.
+     * A diverging solver is reported explicitly instead of leaking into the maps.
+     */
+    private static void checkSolverResidual(double xDistorted, double yDistorted,
+                                            double[] undistorted, double[] d, double[] k) {
+        double x = undistorted[0];
+        double y = undistorted[1];
+        double r2 = x * x + y * y;
+        double radial = 1.0 + d[0] * r2 + d[1] * r2 * r2 + d[4] * r2 * r2 * r2;
+        double xd = x * radial + 2.0 * d[2] * x * y + d[3] * (r2 + 2.0 * x * x);
+        double yd = y * radial + d[2] * (r2 + 2.0 * y * y) + 2.0 * d[3] * x * y;
+        double residualPx = Math.hypot((xd - xDistorted) * k[0], (yd - yDistorted) * k[4]);
+        if (!Double.isFinite(residualPx)) {
+            throw new RectificationException(
+                    "undistortion solver diverged for this calibration",
+                    RectificationException.Reason.SOLVER_DIVERGED);
+        }
+        if (residualPx > SELF_CHECK_RESIDUAL_PX) {
+            throw new RectificationException(
+                    "undistortion reprojection residual " + residualPx
+                            + " px exceeds bound " + SELF_CHECK_RESIDUAL_PX + " px",
+                    RectificationException.Reason.RESIDUAL_EXCEEDS_BOUND);
+        }
     }
 
     private static double[] undistortNormalized(double xDistorted, double yDistorted, double[] d) {

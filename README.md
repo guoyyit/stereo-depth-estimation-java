@@ -64,10 +64,20 @@
 ## 标定参数版本一致性保证
 
 - `CalibrationRegistry.register` 注册带 `version` 的参数；最新注册者成为 `activeVersion`。
-- 帧提交（`StereoProcessingService.submit`）时立即冻结参数快照：**在途帧始终使用其启动时的版本**，
-  即便处理期间注册表更新；后续未显式指定版本的帧使用新版本；显式请求旧版本仍可处理。
-- 请求版本为空白、`null` 且无任何已注册版本、或版本号不存在时，明确抛
-  `CalibrationVersionException`，拒绝处理，绝不混用或猜测。
+- **标定内容按版本不可变**：同一版本标识一旦被注册，其内容即冻结。再次注册同一版本时：
+  - 内容完全一致（`CalibrationParams.contentEquals`，含版本号与全部数组逐位相等）→ 幂等成功，
+    该版本重新成为 `activeVersion`，注册表内容不变；
+  - 内容有任何差异 → 显式拒绝，抛 `CalibrationVersionException` 且
+    `reason() == CONTENT_CONFLICT`，注册表保持原状（原内容仍可解析，`activeVersion` 不变）。
+- 失败原因机器可区分（`CalibrationVersionException.Reason`）：
+  `MISSING_VERSION`（版本为空白/null）、`NO_REGISTERED_VERSION`（尚无任何注册）、
+  `UNKNOWN_VERSION`（版本号不存在）、`CONTENT_CONFLICT`（同版本不同内容）。
+- 帧提交（`StereoProcessingService.submit`）时立即冻结参数快照：**在途帧始终使用其启动时的
+  标定内容**，处理期间发生的注册/切换不影响该帧结果（并发交错下该帧输出与无更新时的结果
+  逐位一致）；后续未显式指定版本的帧使用新版本；显式请求旧版本仍可处理。
+- 同一帧的全部输出（视差、深度、点云）来自同一份标定内容：校正映射缓存同时按版本号与
+  内容指纹（`contentFingerprint`）校验，指纹不符即拒绝（`CONTENT_CONFLICT`），
+  输出上标注的版本与该帧实际使用的标定内容一一对应。
 - 每个输出（`StereoResult`、`DepthMap`、`PointCloud`）都带 `calibrationVersion` 标注。
 
 ## 帧序列、并发、失败与取消
@@ -79,24 +89,56 @@
 - 取消为**协作式令牌**（`cancel(frameId, …)`）：在每行匹配与各阶段边界检查；取消不中断工作线程、
   不从队列移除任务，因此不会杀死固定线程池中的线程而造成队列死锁，也不会让返回的 future 永不完成。
   被取消帧在 `history` 中 `cancelled=true`，future 以 `FrameCancelledException` 完成。
+- **终态保证（exactly-once）**：每个已提交帧恰好进入成功/失败/取消之一，计数器、历史与 future
+  完成三者一致。执行器拒绝接收（如服务已关闭）或服务 `close()` 时仍在途/排队的帧，
+  都会被显式完结为可区分的终态（拒绝为失败、关闭为取消），任何情况下 future 都不会永不完成；
+  高负载与队列积压下取消任一在途或排队帧，其余帧正常完成，后续帧不被阻塞。
 - 同一 `frameId` 在途重复提交会被 `InvalidFrameException` 拒绝。
+
+## 校正几何的独立验证与精度上界
+
+校正几何的验证建立在**独立参考**之上，不与被测流程共用映射计算：
+
+- 测试域 `IndependentCameraModel` 以独立代码路径（四元数旋转、解析雅可比 Newton 去畸变）
+  实现 Brown–Conrady 投影/去畸变；`IndependentRectificationReference` 以四元数代数独立
+  重推半旋转校正映射。合成场景的原始图由该独立模型生成，**不调用** `RectificationEngine`。
+- `RectificationGeometryTest` 强制校验（固定随机种子，可复现）：
+  - 引擎映射 vs 独立参考映射的重投影残差 `≤ 0.05px`（实测约 `1e-5px`）；
+  - 随机 3D 参考点经独立投影后，引擎校正结果的左右行对齐残差（极线残差）`≤ 0.05px`；
+  - 精确对应点的射线-基线共面性残差 `≤ 0.05px`。
+- **支持范围**（`RectificationEngine` 常量）：`|k1| ≤ 0.3`、`|k2| ≤ 0.5`、`|k3| ≤ 0.5`、
+  `|p1|,|p2| ≤ 0.02`、旋转矢量模长 `≤ 0.35 rad`。范围内校正残差满足上述上界；
+  范围外或自检不通过的标定**显式失败**，抛 `RectificationException`，原因机器可区分：
+  `OUT_OF_SUPPORTED_RANGE` / `DEGENERATE_BASELINE` / `BEHIND_CAMERA` /
+  `SOLVER_DIVERGED` / `NON_FINITE_MAP` / `RESIDUAL_EXCEEDS_BOUND`，
+  绝不静默输出偏差过大或非有限的几何。引擎自检含去畸变往返残差 `≤ 0.01px` 与
+  映射表有限性检查。
 
 ## 精度约定（合成数据，可复现）
 
-合成场景（`SyntheticScene`）用与 `RectificationEngine` 相同的前向投影公式，从已知真值视差场
-（含 10px 视差阶跃、无纹理矩形块、遮挡背景、相机畸变与小旋转）生成左右原始图，带真值视差与真值
-`InvalidReason`。在固定随机种子下：
+合成场景（`SyntheticScene`）由上述独立投影/畸变模型从已知真值视差场
+（含 10px 视差阶跃、无纹理矩形块、遮挡背景、相机畸变与小旋转）生成左右原始图，
+带真值视差与真值 `InvalidReason`。在固定随机种子下：
 
-- 视差平均绝对误差 `mean ≤ 1.5px`，`p95 ≤ 2.0px`，`p99 ≤ 4.0px`
+- 默认配置（SAD、聚合半径 0、全分辨率）：视差平均绝对误差 `mean ≤ 1.5px`，
+  `p95 ≤ 2.0px`，`p99 ≤ 4.0px`
   （评估区剔除图像确定边缘带与 2px 视差不连续邻域；这些边界像素本身被标为 `BORDER`/`OCCLUDED`）。
-- 半分辨率与全分辨率结果，在同为有效的像素上：均值偏差 `≤ 1.5px`，`p90 ≤ 3.0px`。
-- 固定输入 + 固定种子下，逐像素视差与无效标记**逐帧完全一致（bit-identical）**，
-  合成数据生成本身同样确定，可复现历史结论。
+- 代价×聚合矩阵（SAD/SSD/NCC × 聚合半径 1/2，全分辨率）：`mean ≤ 1.5px`、`p95 ≤ 2.0px`、
+  `p99 ≤ 5.0px`（NCC 尾部略宽于默认配置，上界按矩阵单独声明，默认配置上界不放宽）。
+- 降采样组合（SAD/SSD/NCC × 聚合半径 0/2 × 0.5/0.25 倍）与同配置全分辨率结果，
+  在同为有效的像素上：均值偏差 `≤ 1.5px`，`p90 ≤ 3.0px`。
+- 固定输入 + 固定种子下，矩阵内每种组合的逐像素视差与无效标记**逐帧完全一致
+  （bit-identical）**，合成数据生成本身同样确定，可复现历史结论。
 
-这些上界由 `AccuracyTest`、`ResolutionAndDeterminismTest` 以断言形式强制校验。
+这些上界由 `AccuracyTest`、`AggregationAccuracyTest`、`ResolutionAndDeterminismTest`
+以断言形式强制校验。
 
 ## 验证范围
 
-`mvn test`（23 个测试）覆盖：精度与亚像素、三种代价、遮挡/无纹理/边界可区分标记与 NaN 深度、
-结果版本标注；标定版本缺失/空白/不存在拒绝、在途版本冻结、更新后新版本；多分辨率偏差与逐帧确定性；
-失败隔离、取消、并发独立版本化结果、有界历史、重复帧拒绝；边界模式与参数范围校验。
+`mvn test`（42 个测试）覆盖：精度与亚像素、三种代价、遮挡/无纹理/边界可区分标记与 NaN 深度、
+结果版本标注；标定内容不可变（同版本异内容冲突拒绝、同内容幂等、四类失败原因可区分）、
+版本缺失/空白/不存在拒绝、在途版本冻结与逐位一致、更新后新版本、并发注册与提交交错下的
+版本可追溯；校正几何独立参考验证（重投影/极线/行对齐残差、较强畸变与旋转、越界与退化
+标定的显式可区分失败）；聚合半径大于零的代价×降采样组合精度与逐位确定性；
+失败隔离、取消（在途与排队）、高负载积压下取消后其余帧正常完成、关闭时在途帧必然完结、
+有界历史、重复帧拒绝；边界模式与参数范围校验。

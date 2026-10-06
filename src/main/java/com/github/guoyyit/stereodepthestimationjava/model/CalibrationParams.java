@@ -1,5 +1,7 @@
 package com.github.guoyyit.stereodepthestimationjava.model;
 
+import java.util.Arrays;
+
 public final class CalibrationParams {
 
     private final String version;
@@ -55,6 +57,48 @@ public final class CalibrationParams {
     public static CalibrationParams create(String version, int imageWidth, int imageHeight,
                                            double[] k, double[] d, double[] r, double[] t) {
         return new CalibrationParams(version, imageWidth, imageHeight, k, d, r, t);
+    }
+
+    /**
+     * Full content equality: every calibration field (including the version) must be
+     * exactly equal. Used by the registry to decide whether a repeated registration is
+     * an idempotent no-op or a forbidden content conflict.
+     */
+    public boolean contentEquals(CalibrationParams other) {
+        if (other == null) {
+            return false;
+        }
+        return version.equals(other.version)
+                && imageWidth == other.imageWidth
+                && imageHeight == other.imageHeight
+                && Arrays.equals(k, other.k)
+                && Arrays.equals(d, other.d)
+                && Arrays.equals(r, other.r)
+                && Arrays.equals(t, other.t);
+    }
+
+    /**
+     * Stable fingerprint of the full calibration content. Frames and rectification maps
+     * carry this so a result can be traced to the exact calibration content that produced
+     * it, not merely to a version label.
+     */
+    public long contentFingerprint() {
+        long h = 0xcbf29ce484222325L;
+        h = mix(h, version.hashCode());
+        h = mix(h, imageWidth);
+        h = mix(h, imageHeight);
+        for (double v : k) { h = mix(h, Double.doubleToLongBits(v)); }
+        for (double v : d) { h = mix(h, Double.doubleToLongBits(v)); }
+        for (double v : r) { h = mix(h, Double.doubleToLongBits(v)); }
+        for (double v : t) { h = mix(h, Double.doubleToLongBits(v)); }
+        return h;
+    }
+
+    private static long mix(long h, long v) {
+        h ^= v;
+        h *= 0x100000001b3L;
+        h ^= h >>> 29;
+        return h;
     }
 
     private static void requireLength(double[] values, int expected, String name) {

@@ -136,58 +136,35 @@ public final class SyntheticScene {
         return right;
     }
 
+    /**
+     * Warps a rectified-domain image into a raw camera image using the independent
+     * reference mapping ({@link IndependentRectificationReference}), never the
+     * production rectification code, so that accuracy verdicts do not rely on the
+     * same mapping computation that is under test.
+     */
     private static float[] forwardDistort(int width, int height, float[] rectified,
                                           CalibrationParams calibration, boolean leftSide) {
-        RectificationMaps maps = new RectificationEngine().buildMaps(calibration);
-        float[] mapX = leftSide ? maps.mapXLeft() : maps.mapXRight();
-        float[] mapY = leftSide ? maps.mapYLeft() : maps.mapYRight();
+        RectificationMaps engineMaps = new RectificationEngine().buildMaps(calibration);
+        IndependentRectificationReference reference =
+                new IndependentRectificationReference(calibration, engineMaps.rectifiedK());
         float[] raw = new float[width * height];
         float[] weight = new float[width * height];
         for (int py = 0; py < height; py++) {
             for (int px = 0; px < width; px++) {
                 int p = py * width + px;
-                float rx = px;
-                float ry = py;
-                for (int iteration = 0; iteration < 12; iteration++) {
-                    int ix = (int) Math.floor(rx);
-                    int iy = (int) Math.floor(ry);
-                    if (ix < 0 || iy < 0 || ix >= width - 1 || iy >= height - 1) {
-                        break;
-                    }
-                    float fx = rx - ix;
-                    float fy = ry - iy;
-                    int i00 = iy * width + ix;
-                    float mx = bilinear(mapX[i00], mapX[i00 + 1], mapX[i00 + width],
-                            mapX[i00 + width + 1], fx, fy);
-                    float my = bilinear(mapY[i00], mapY[i00 + 1], mapY[i00 + width],
-                            mapY[i00 + width + 1], fx, fy);
-                    float dxdx = (1 - fy) * (mapX[i00 + 1] - mapX[i00])
-                            + fy * (mapX[i00 + width + 1] - mapX[i00 + width]);
-                    float dxdy = (1 - fx) * (mapX[i00 + width] - mapX[i00])
-                            + fx * (mapX[i00 + width + 1] - mapX[i00 + 1]);
-                    float dydx = (1 - fy) * (mapY[i00 + 1] - mapY[i00])
-                            + fy * (mapY[i00 + width + 1] - mapY[i00 + width]);
-                    float dydy = (1 - fx) * (mapY[i00 + width] - mapY[i00])
-                            + fx * (mapY[i00 + width + 1] - mapY[i00 + 1]);
-                    float det = dxdx * dydy - dxdy * dydx;
-                    if (Math.abs(det) < 1e-6f) {
-                        break;
-                    }
-                    float ex = mx - px;
-                    float ey = my - py;
-                    if (Math.abs(ex) < 1e-4f && Math.abs(ey) < 1e-4f) {
-                        break;
-                    }
-                    rx -= (dydy * ex - dxdy * ey) / det;
-                    ry -= (-dydx * ex + dxdx * ey) / det;
+                double[] source = leftSide ? reference.mapLeft(px, py) : reference.mapRight(px, py);
+                double rx = source[0];
+                double ry = source[1];
+                if (Double.isNaN(rx) || Double.isNaN(ry)) {
+                    continue;
                 }
                 int x0 = (int) Math.floor(rx);
                 int y0 = (int) Math.floor(ry);
                 if (x0 < 0 || y0 < 0 || x0 >= width - 1 || y0 >= height - 1) {
                     continue;
                 }
-                float fx = rx - x0;
-                float fy = ry - y0;
+                float fx = (float) (rx - x0);
+                float fy = (float) (ry - y0);
                 float value = rectified[p];
                 splat(raw, weight, width, x0, y0, (1 - fx) * (1 - fy), value);
                 splat(raw, weight, width, x0 + 1, y0, fx * (1 - fy), value);
@@ -199,12 +176,6 @@ public final class SyntheticScene {
             raw[i] = weight[i] > 1e-6f ? raw[i] / weight[i] : 0f;
         }
         return raw;
-    }
-
-    private static float bilinear(float v00, float v01, float v10, float v11, float fx, float fy) {
-        float top = v00 + (v01 - v00) * fx;
-        float bottom = v10 + (v11 - v10) * fx;
-        return top + (bottom - top) * fy;
     }
 
     private static void splat(float[] raw, float[] weight, int width, int x, int y,
